@@ -220,4 +220,3 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Local Airbnb dataset
-data/raw/

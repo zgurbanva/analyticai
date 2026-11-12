@@ -1,191 +1,451 @@
+"""Analytica AI — traveler-focused Airbnb market explorer.
+Run: python -m streamlit run app.py
+Requires existing Inside Airbnb datasets and optional trained joblib pipelines.
+"""
+from __future__ import annotations
+import html
 import re
+from datetime import date, timedelta
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
 
-st.set_page_config(page_title="Analytica AI | Airbnb Intelligence", page_icon="🏙️", layout="wide")
-st.markdown("""<style>.block-container{padding-top:1.5rem}div[data-testid='stMetric']{background:#f3f6fb;padding:14px;border-radius:12px}h1{color:#15345a}</style>""", unsafe_allow_html=True)
+st.set_page_config(page_title="Analytica AI | Travel Advisor", page_icon="✈️", layout="wide")
+ROOT = Path(__file__).resolve().parent
+MARKETS = {
+    "Amsterdam": {"file": "listings.csv.gz", "model": "amsterdam.joblib", "currency": "€", "center": (52.37, 4.90)},
+    "New York City": {"file": "nyc_listings.csv.gz", "model": "nyc.joblib", "currency": "$", "center": (40.73, -73.94)},
+}
+PAGES = ["Home Dashboard", "Plan My Trip", "Explore Stays", "Neighborhood Explorer", "Interactive Map", "AI Price Advisor", "AI Travel Assistant"]
+FEATURES = ["accommodates", "bedrooms", "bathrooms", "minimum_nights", "number_of_reviews", "room_type"]
 
-DATA_PATH = "data/raw/listings.csv.gz"
+st.markdown("""<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+:root{--ink:#eef2ff;--muted:#a4b2cf;--line:#293757;--violet:#aa91ff;--teal:#5ce3d0}
+html,body,[class*="css"],button,input,textarea{font-family:'DM Sans',sans-serif}
+[data-testid="stAppViewContainer"]{background:radial-gradient(ellipse 75% 38% at 85% -9%,rgba(100,69,185,.24),transparent 75%),radial-gradient(ellipse 45% 40% at 100% 55%,rgba(20,115,127,.08),transparent 75%),#090f1e;color:var(--ink)}
+[data-testid="stHeader"]{background:transparent}
+[data-testid="stSidebar"]{background:linear-gradient(175deg,#10182e,#0b1223 62%,#090f1d);border-right:1px solid #2a3550;box-shadow:12px 0 36px #04071344}
+[data-testid="stSidebar"]>div:first-child{padding:1.35rem 1rem}
+[data-testid="stSidebar"] [data-testid="stRadio"]>label{display:none}
+[data-testid="stSidebar"] [data-testid="stRadio"]>div{gap:5px}
+[data-testid="stSidebar"] [data-testid="stRadio"] label{border:1px solid transparent;border-radius:11px;padding:9px 11px;transition:.2s;background:transparent}
+[data-testid="stSidebar"] [data-testid="stRadio"] label:hover{background:#1a2744;border-color:#344264}
+[data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked){background:linear-gradient(100deg,#42336d88,#203c5a66);border-color:#7665bb;box-shadow:inset 3px 0 #ad9aff}
+[data-testid="stSidebar"] [data-testid="stRadio"] label p{font-size:13px;font-weight:650;color:#c1c9e0}
+[data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) p{color:white}
+.block-container{max-width:1480px;padding:1.7rem 2.25rem 3rem}
+h1,h2,h3,h4{font-family:Manrope,sans-serif!important;color:#f3f5ff!important;letter-spacing:-.035em}
+h3{font-size:1.15rem!important;margin-top:1.2rem!important}
+[data-testid="stCaptionContainer"]{color:#a2b2ce!important}
+[data-testid="stMetric"]{background:linear-gradient(150deg,#1b2844,#121d33 85%);border:1px solid #35435f;border-radius:17px;padding:19px 20px;min-height:124px;box-shadow:0 12px 28px #03081633,inset 0 1px #ffffff0a}
+[data-testid="stMetricLabel"] p{font-size:12px!important;font-weight:650;color:#a6b4d1!important}
+[data-testid="stMetricValue"]{font-family:Manrope,sans-serif;color:#f6f4ff!important;font-weight:800;letter-spacing:-.04em}
+[data-testid="stForm"]{background:linear-gradient(145deg,#16223b,#111a2e);border:1px solid #34445f;border-radius:19px;padding:20px}
+[data-testid="stDataFrame"]{border:1px solid #33425f;border-radius:14px;overflow:hidden}
+[data-testid="stPlotlyChart"]{background:linear-gradient(150deg,#151f35,#101a2d);border:1px solid #2b3a56;border-radius:18px;padding:12px 12px 5px;box-shadow:0 10px 25px #03071322}
+.stButton>button,.stDownloadButton>button,[data-testid="stFormSubmitButton"] button{border-radius:11px;min-height:43px;font-weight:700;border-color:#435375}
+.stButton>button[kind="primary"],[data-testid="stFormSubmitButton"] button[kind="primary"]{background:linear-gradient(105deg,#8066eb,#6559c8);border:1px solid #a392ff;color:#fff;box-shadow:0 8px 22px #7058d344}
+.stButton>button:hover,.stDownloadButton>button:hover{border-color:#a392ff;color:#fff}
+[data-testid="stChatMessage"]{background:#151f35;border:1px solid #2c3a57;border-radius:15px;margin:10px 0;padding:12px}
+[data-testid="stChatInput"]{border-radius:14px}
+[data-testid="stAlert"]{border-radius:13px}
+.brand{padding:13px 10px 18px;margin-bottom:10px;border-bottom:1px solid #293854}
+.brand-mark{display:inline-flex;width:34px;height:34px;align-items:center;justify-content:center;border-radius:11px;margin-right:9px;background:linear-gradient(145deg,#7664db,#253f72);color:#fff;box-shadow:0 0 25px #7961da55}
+.brand-title{font:800 22px Manrope,sans-serif;letter-spacing:-.065em;color:#fff}
+.brand-title b{color:#b3a0ff}
+.brand-sub{margin:9px 0 0 3px;color:#7f92b4;font-size:10px;letter-spacing:.14em;font-weight:800}
+.sidebar-label{font-size:10px;color:#8193b5;letter-spacing:.16em;font-weight:800;margin:15px 8px 7px;text-transform:uppercase}
+.side-note{margin-top:16px;border:1px solid #2d4260;background:linear-gradient(135deg,#1b2943,#112b35);border-radius:13px;padding:14px;color:#a9bad5;font-size:11px;line-height:1.7}
+.side-note strong{color:#f2f5ff;font-size:12px}
+.hero{position:relative;overflow:hidden;padding:34px 34px 31px;border:1px solid #455075;border-radius:22px;background:radial-gradient(circle at 95% 15%,#6b54b85e,transparent 30%),radial-gradient(circle at 70% 100%,#166c7952,transparent 40%),linear-gradient(115deg,#252b52,#151d36 72%,#142d3c);box-shadow:0 18px 45px #03071644,inset 0 1px #ffffff19;margin-bottom:25px}
+.hero:after{content:'✧';position:absolute;right:6%;top:10%;font-size:145px;line-height:1;color:#ffffff0b;pointer-events:none}
+.hero h1{font-size:clamp(27px,3vw,42px);font-weight:800;letter-spacing:-.055em;margin:9px 0 10px;position:relative;z-index:1}
+.hero p{font-size:14px;line-height:1.7;color:#c1cbe1;margin:0;max-width:740px;position:relative;z-index:1}
+.kicker{color:#c2b2ff;letter-spacing:.17em;font-size:10px;font-weight:800}
+.hero-pills{display:flex;gap:9px;flex-wrap:wrap;margin-top:18px;position:relative;z-index:1}
+.hero-pill{border:1px solid #7880b566;background:#ffffff12;color:#d9ddff;border-radius:100px;padding:6px 12px;font-size:11px;font-weight:700}
+.footer{border-top:1px solid #2a3752;margin-top:40px;padding:18px 0;color:#8396b8;font-size:11px}
+@media(max-width:850px){.block-container{padding:1rem .85rem 2rem}.hero{padding:24px 19px}.hero:after{font-size:90px}}
+</style>""", unsafe_allow_html=True)
 
-@st.cache_data(show_spinner="Loading Airbnb data...")
-def load_data():
-    data = pd.read_csv(DATA_PATH, low_memory=False)
-    if "price" not in data.columns:
-        raise ValueError("The dataset does not contain a 'price' column.")
-    data["price_eur"] = pd.to_numeric(
-        data["price"].astype(str).str.replace(r"[^\d.,]", "", regex=True)
-        .str.replace(",", "", regex=False), errors="coerce"
+@st.cache_data(show_spinner="Loading Airbnb listings…")
+def load_market(city):
+    path = ROOT / "data" / "raw" / MARKETS[city]["file"]
+    if not path.exists():
+        return None
+    df = pd.read_csv(path, low_memory=False)
+    for col in ["price", "name", "room_type", "neighbourhood_cleansed", "neighbourhood_group_cleansed", "listing_url", "bathrooms_text"]:
+        if col not in df:
+            df[col] = np.nan
+    price_text = df["price"].astype(str).str.replace(r"[^0-9.,]", "", regex=True).str.replace(",", "", regex=False)
+    df["price_num"] = pd.to_numeric(price_text, errors="coerce")
+    for col in ["accommodates", "bedrooms", "bathrooms", "minimum_nights", "number_of_reviews", "review_scores_rating", "latitude", "longitude"]:
+        if col not in df:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    if df["bathrooms"].isna().all():
+        df["bathrooms"] = pd.to_numeric(df["bathrooms_text"].astype(str).str.extract(r"(\d+(?:\.\d+)?)")[0], errors="coerce")
+    area_col = "neighbourhood_group_cleansed" if city == "New York City" else "neighbourhood_cleansed"
+    df["area"] = df[area_col].fillna("Other").replace("", "Other").astype(str)
+    df["room_type"] = df["room_type"].fillna("Unknown").astype(str)
+    df["name"] = df["name"].fillna("Unnamed listing").astype(str)
+    return df
+
+@st.cache_resource
+def load_model(path, modified):
+    import joblib
+    return joblib.load(path)
+
+def money(value, city):
+    return f"{MARKETS[city]['currency']}{value:,.0f}" if pd.notna(value) and np.isfinite(value) else "—"
+
+def positive(df):
+    return df.loc[df["price_num"].notna() & (df["price_num"] > 0)]
+
+def grouped(df):
+    return (df.groupby("area").agg(listings=("name", "size"), median_price=("price_num", "median"), avg_rating=("review_scores_rating", "mean")).reset_index().sort_values("listings", ascending=False))
+
+def listing_view(df, city, limit=30):
+    if df.empty:
+        st.info("No matching listings with a valid advertised price. Try a different budget or room type.")
+        return
+    cols = ["name", "area", "room_type", "price_num", "accommodates", "minimum_nights", "review_scores_rating"]
+    view = df[cols].head(limit).copy().rename(columns={"price_num": f"Price/night ({MARKETS[city]['currency']})", "minimum_nights": "Min. nights"})
+    st.dataframe(view, width="stretch", hide_index=True)
+    st.download_button("Download matching listings", df[cols].to_csv(index=False).encode("utf-8-sig"), "matching_stays.csv", "text/csv")
+    st.caption("Historical listing snapshots only. These results do not confirm availability, current prices or reservations.")
+
+def travel_matches(df, budget, guests, nights, room, area=None):
+    out = positive(df)
+    out = out.loc[(out["price_num"] <= budget) & (out["accommodates"] >= guests) & (out["minimum_nights"] <= nights)]
+    if room != "Any room type":
+        out = out.loc[out["room_type"] == room]
+    if area and area != "Any area":
+        out = out.loc[out["area"] == area]
+    return out.sort_values(["price_num", "number_of_reviews"], ascending=[True, False])
+
+with st.sidebar:
+    st.markdown('<div class="brand"><div class="brand-title"><span class="brand-mark">✦</span>Analytica <b>AI</b></div><div class="brand-sub">YOUR PERSONAL TRAVEL INTELLIGENCE</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-label">Discover</div>', unsafe_allow_html=True)
+    icons = ["⌂", "✈", "▤", "◎", "⌖", "✧", "◈"]
+    page = st.radio("Explore", PAGES, format_func=lambda p: f"{icons[PAGES.index(p)]}   {p}", label_visibility="collapsed")
+    st.divider()
+    st.markdown('<div class="sidebar-label">Your destination</div>', unsafe_allow_html=True)
+    city = st.selectbox("Destination", list(MARKETS))
+    df = load_market(city)
+    if df is None:
+        st.error(f"Missing data/raw/{MARKETS[city]['file']}. Keep the dataset in the same project folder as app.py.")
+        st.stop()
+    st.markdown('<div class="side-note"><strong>✦ Travel intelligence</strong><br>Explore historical Airbnb listings and plan smarter. Availability and booking prices are not live.</div>', unsafe_allow_html=True)
+
+st.markdown(f'<div class="hero"><div class="kicker">✦ ANALYTICA AI &nbsp; / &nbsp; YOUR TRAVEL COMPANION</div><h1>{html.escape(page)}</h1><p>Discover your next stay in {html.escape(city)}. Compare neighborhoods, explore real listing data and plan your budget with confidence.</p><div class="hero-pills"><span class="hero-pill">✈ {html.escape(city)}</span><span class="hero-pill">◈ Data-powered insights</span><span class="hero-pill">✧ Smart travel planning</span></div></div>', unsafe_allow_html=True)
+priced = positive(df)
+
+if page == "Home Dashboard":
+    a,b,c,d = st.columns(4)
+    a.metric("Listings", f"{len(df):,}")
+    b.metric("Listings with prices", f"{len(priced):,}")
+    c.metric("Median nightly price", money(priced["price_num"].median(), city))
+    d.metric("Neighborhoods / areas", df["area"].nunique())
+    left,right = st.columns(2)
+    with left:
+        st.subheader("Room types")
+        counts = df["room_type"].value_counts().reset_index()
+        st.plotly_chart(px.pie(counts, names="room_type", values="count", hole=.65, color_discrete_sequence=["#9888ff", "#49d8c2", "#72a8ff", "#f4c179"]), width="stretch")
+    with right:
+        st.subheader("Advertised price distribution")
+        if not priced.empty:
+            cap = priced["price_num"].quantile(.98)
+            st.plotly_chart(px.histogram(priced.loc[priced["price_num"] <= cap], x="price_num", nbins=35, labels={"price_num": f"Price/night ({MARKETS[city]['currency']})"}, color_discrete_sequence=["#49d8c2"]), width="stretch")
+    st.info("Start with Plan My Trip to find historical listings that match your budget and group size.")
+
+elif page == "Plan My Trip":
+    st.subheader("Tell us about your trip")
+    with st.form("trip_form"):
+        a,b = st.columns(2)
+        with a:
+            arrival = st.date_input("Arrival date", min_value=date.today(), value=date.today()+timedelta(days=1))
+            nights = st.number_input("Nights", min_value=1, max_value=90, value=3)
+            guests = st.number_input("Travelers", min_value=1, max_value=30, value=2)
+        with b:
+            budget = st.number_input(f"Maximum price per night ({MARKETS[city]['currency']})", min_value=1, max_value=10000, value=150)
+            room = st.selectbox("Room preference", ["Any room type"] + sorted(df["room_type"].unique().tolist()))
+            area = st.selectbox("Preferred area", ["Any area"] + sorted(df["area"].unique().tolist()))
+        submitted = st.form_submit_button("Find matching stays", type="primary")
+    if submitted:
+        matches = travel_matches(df, budget, guests, nights, room, area)
+        st.session_state["trip"] = {"city":city,"arrival":str(arrival),"nights":int(nights),"guests":int(guests),"budget":int(budget),"room":room,"area":area}
+        a,b,c = st.columns(3)
+        a.metric("Historical matches", f"{len(matches):,}")
+        b.metric("Maximum stay budget", money(budget*nights, city))
+        c.metric("Median matching nightly price", money(matches["price_num"].median(), city))
+        st.caption(f"Arrival: {arrival} · {nights} nights. Dates are for budget planning only; availability is not verified.")
+        listing_view(matches, city, 40)
+
+elif page == "Explore Stays":
+    st.subheader("Find listings that fit your preferences")
+    a,b,c = st.columns(3)
+    with a:
+        budget = st.slider(f"Max price/night ({MARKETS[city]['currency']})", 25, 1500, 200, 25)
+    with b:
+        guests = st.number_input("Travelers", 1, 30, 2)
+    with c:
+        room = st.selectbox("Room type", ["Any room type"]+sorted(df["room_type"].unique().tolist()))
+    matches = travel_matches(df, budget, guests, 90, room)
+    st.metric("Matching historical listings", f"{len(matches):,}")
+    listing_view(matches, city, 100)
+
+elif page == "Neighborhood Explorer":
+    st.subheader("Compare neighborhoods by advertised prices")
+    areas = grouped(priced)
+    min_count = st.slider("Minimum priced listings per area", 1, 100, 10)
+    areas = areas.loc[areas["listings"] >= min_count]
+    if areas.empty:
+        st.info("No areas meet this threshold.")
+    else:
+        st.dataframe(areas.round(1), width="stretch", hide_index=True)
+        chart = areas.nlargest(15,"listings").sort_values("median_price")
+        st.plotly_chart(px.bar(chart, x="median_price", y="area", orientation="h", color_discrete_sequence=["#9888ff"], labels={"median_price":f"Median nightly price ({MARKETS[city]['currency']})","area":"Area"}), width="stretch")
+        st.caption("Cheaper does not necessarily mean safer, more convenient or available for your dates.")
+
+elif page == "Interactive Map":
+    st.subheader("Explore where listings are located")
+    lat,lon = MARKETS[city]["center"]
+    geo = df.dropna(subset=["latitude","longitude"])
+    geo = geo.loc[geo["latitude"].between(lat-1.5,lat+1.5) & geo["longitude"].between(lon-1.5,lon+1.5)]
+    if geo.empty:
+        st.info("No valid coordinates are available.")
+    else:
+        n = st.slider("Map sample", 100, 5000, 1500, 100)
+        sample = geo.sample(n=min(n,len(geo)), random_state=42)
+        st.map(sample, latitude="latitude", longitude="longitude", size=6, color="#9888ff")
+        st.caption(f"Showing {len(sample):,} historical listings. Markers do not indicate availability.")
+
+elif page == "AI Price Advisor":
+    st.subheader("Estimate a nightly listing price")
+    path = ROOT / "models" / MARKETS[city]["model"]
+    if not path.exists():
+        st.warning("Saved prediction model not found. Add the original model file to the models directory.")
+    else:
+        try:
+            model = load_model(str(path), path.stat().st_mtime_ns)
+            with st.form("price_advisor"):
+                a,b,c = st.columns(3)
+                with a:
+                    room = st.selectbox("Room type", sorted(df["room_type"].unique().tolist()))
+                    guests = st.number_input("Accommodates", 1, 30, 2)
+                with b:
+                    bedrooms = st.number_input("Bedrooms", 0, 20, 1)
+                    bathrooms = st.number_input("Bathrooms", 0.0, 20.0, 1.0, .5)
+                with c:
+                    nights = st.number_input("Minimum nights", 1, 365, 2)
+                    reviews = st.number_input("Number of reviews", 0, 10000, 25)
+                submit = st.form_submit_button("Predict price", type="primary")
+            if submit:
+                x = pd.DataFrame([{"accommodates":guests,"bedrooms":bedrooms,"bathrooms":bathrooms,"minimum_nights":nights,"number_of_reviews":reviews,"room_type":room}], columns=FEATURES)
+                prediction = float(model.predict(x)[0])
+                if np.isfinite(prediction) and prediction >= 0:
+                    st.metric("Estimated advertised price/night", money(prediction, city))
+                else:
+                    st.warning("Model returned an invalid price estimate.")
+            st.caption("This model uses six property features. It does not consider neighborhood, travel dates, or live availability.")
+        except Exception as e:
+            st.error(f"Could not use the saved model: {e}")
+
+elif page == "AI Travel Assistant":
+    st.subheader("Your personal AI travel advisor")
+    st.caption("Conversational AI · Grounded in historical Inside Airbnb market data · No live availability")
+    try:
+        from openai import OpenAI
+    except ImportError:
+        st.error("API client package is missing. Run: pip install openai")
+        st.stop()
+
+    st.markdown("#### 🔑 Connect your own Groq account")
+    st.caption("Bring your own API key (BYOK). The app never uses the owner’s API key and does not save visitor keys to a file or database.")
+    entered_key = st.text_input(
+        "Your Groq API key", type="password", key="visitor_groq_api_key",
+        placeholder="gsk_...", help="Create a key at https://console.groq.com/keys. Never paste it into public chats or GitHub.",
     )
-    for col in ["minimum_nights", "number_of_reviews", "availability_365", "accommodates", "bedrooms", "beds", "review_scores_rating"]:
-        if col in data:
-            data[col] = pd.to_numeric(data[col], errors="coerce")
-    if "neighbourhood_cleansed" in data:
-        data["neighborhood"] = data["neighbourhood_cleansed"].fillna("Unknown").astype(str)
-    elif "neighbourhood" in data:
-        data["neighborhood"] = data["neighbourhood"].fillna("Unknown").astype(str)
-    else:
-        data["neighborhood"] = "Unknown"
-    data["room_type"] = data.get("room_type", pd.Series("Unknown", index=data.index)).fillna("Unknown").astype(str)
-    data = data.dropna(subset=["price_eur"])
-    data = data[data["price_eur"].between(10, 2000)].copy()  # documented outlier bounds
-    return data
+    # Only the visitor-provided key is accepted; never use server secrets or environment variables.
+    api_key = entered_key.strip()
+    model_name = st.selectbox(
+        "AI model", ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],
+        help="Availability depends on your Groq account and its current limits.",
+    )
+    if not api_key:
+        st.info("Enter your own Groq API key above to start chatting. It stays in this browser session's Streamlit state until you clear it or the session ends.")
+        st.markdown("[Create a Groq API key](https://console.groq.com/keys)")
+        st.stop()
+    st.caption("Privacy: your prompt, relevant market statistics, and key are sent to Groq for inference. Use HTTPS when deploying publicly. Free-tier limits depend on your Groq account.")
 
-st.title("🏙️ Analytica AI")
-st.caption("Amsterdam Airbnb Market Intelligence | Inside Airbnb listings snapshot: 16 September 2026")
-try:
-    df = load_data()
-except Exception as exc:
-    st.error(f"Could not load {DATA_PATH}: {exc}")
-    st.info("Place the downloaded listings.csv.gz file in data/raw/ and restart the app.")
-    st.stop()
+    def detect_city(message):
+        text = message.casefold()
+        if re.search(r"\b(nyc|new york|manhattan|brooklyn|queens|bronx|nyu.york|nyu.yorka|nyu.yorkda|n[yü]u.york)\b", text):
+            return "New York City"
+        if re.search(r"\b(amsterdam|ams)\b", text):
+            return "Amsterdam"
+        return None
 
-st.sidebar.header("🔎 Explore the market")
-rooms = st.sidebar.multiselect("Room type", sorted(df["room_type"].unique()), default=sorted(df["room_type"].unique()))
-areas = st.sidebar.multiselect("Neighborhood", sorted(df["neighborhood"].unique()), default=[])
-lo, hi = int(df["price_eur"].min()), int(df["price_eur"].max())
-price_range = st.sidebar.slider("Nightly price (€)", lo, hi, (lo, min(500, hi)))
-filtered = df[df["room_type"].isin(rooms) & df["price_eur"].between(*price_range)]
-if areas:
-    filtered = filtered[filtered["neighborhood"].isin(areas)]
-st.sidebar.caption("Neighborhood: leave blank to include all. Price filters affect dashboard and assistant, not the ML training set.")
-if filtered.empty:
-    st.warning("No listings match these filters. Try broadening the price range or room types.")
-    st.stop()
+    def extract_trip_request(message, market_city):
+        """Extract explicit travel constraints; never guess missing details."""
+        text = message.casefold().replace(",", "")
+        nights_match = re.search(r"(\d{1,3})\s*(?:gecəlik|gecə|gecəyə|nights?|night)", text)
+        nights = int(nights_match.group(1)) if nights_match else None
+        # "3 friends and I" means four travelers, not three.
+        friends = re.search(r"(?:mən\s+)?(\d+)\s+dostumla", text)
+        guest_match = re.search(r"(\d+)\s*(?:nəfər|adam|guests?|people|travelers?)", text)
+        guests = int(friends.group(1)) + 1 if friends else (int(guest_match.group(1)) if guest_match else None)
+        bedrooms_match = re.search(r"(?:ən azı|minimum|at least)?\s*(\d+)\s*(?:yataq otağ|bedrooms?)", text)
+        bedrooms = int(bedrooms_match.group(1)) if bedrooms_match else None
+        amounts = re.findall(r"(?:\$\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:dollar|dollars?|usd|avro|eur|€))", text)
+        amount = float(next((a or b for a,b in amounts), 0)) if amounts else None
+        total = bool(re.search(r"\b(?:ümumi|total|entire budget|whole budget)\b", text))
+        nightly = bool(re.search(r"(?:gecəlik büdcə|per night|nightly budget|/night)", text))
+        budget_night = amount / nights if amount is not None and total and nights else (amount if amount is not None and (nightly or not total) else None)
+        entire = bool(re.search(r"(?:bütöv mənzil|bütöv ev|entire (?:home|apartment|place)|whole apartment)", text))
+        hotel = bool(re.search(r"(?:hotel|otel|mehmanxana)", text))
+        return dict(city=market_city, nights=nights, guests=guests, bedrooms=bedrooms,
+                    budget_total=amount if total else None, budget_night=budget_night,
+                    entire=entire, hotel=hotel)
 
-n_reviews = filtered["number_of_reviews"].sum() if "number_of_reviews" in filtered else 0
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Listings", f"{len(filtered):,}")
-m2.metric("Avg nightly price", f"€{filtered['price_eur'].mean():,.0f}")
-m3.metric("Median nightly price", f"€{filtered['price_eur'].median():,.0f}")
-m4.metric("Recorded reviews", f"{int(n_reviews):,}")
-
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "🧠 Price prediction", "💬 Analytics assistant", "📄 Data & methodology"])
-with tab1:
-    left, right = st.columns(2)
-    with left:
-        counts = filtered.groupby("neighborhood", as_index=False).size().sort_values("size", ascending=False).head(12)
-        fig = px.bar(counts, x="size", y="neighborhood", orientation="h", title="Top neighborhoods by listing count", labels={"size":"Listings", "neighborhood":"Neighborhood"})
-        fig.update_layout(yaxis={"categoryorder":"total ascending"})
-        st.plotly_chart(fig, use_container_width=True)
-    with right:
-        medians = filtered.groupby("room_type", as_index=False)["price_eur"].median()
-        st.plotly_chart(px.bar(medians, x="room_type", y="price_eur", title="Median price by room type", labels={"price_eur":"Median nightly price (€)", "room_type":"Room type"}), use_container_width=True)
-    left, right = st.columns(2)
-    with left:
-        st.plotly_chart(px.histogram(filtered, x="price_eur", nbins=40, title="Nightly price distribution", labels={"price_eur":"Nightly price (€)"}), use_container_width=True)
-    with right:
-        if {"latitude", "longitude"}.issubset(filtered.columns):
-            geo = filtered.dropna(subset=["latitude", "longitude"])
-            if len(geo):
-                st.subheader("Listing locations")
-                st.map(geo[["latitude", "longitude"]].sample(min(1500, len(geo)), random_state=42))
-            else:
-                st.info("No valid coordinates available.")
+    def build_evidence(market_city, request):
+        """Pandas computes every price and count before the LLM receives evidence."""
+        data = load_market(market_city)
+        if data is None:
+            return "Dataset unavailable; no statistics can be reported.", pd.DataFrame()
+        data = positive(data).copy()
+        filters = []
+        if request['guests'] is not None:
+            data = data.loc[data['accommodates'] >= request['guests']]
+            filters.append(f"accommodates >= {request['guests']}")
+        if request['bedrooms'] is not None:
+            data = data.loc[data['bedrooms'] >= request['bedrooms']]
+            filters.append(f"bedrooms >= {request['bedrooms']}")
+        if request['nights'] is not None:
+            data = data.loc[data['minimum_nights'] <= request['nights']]
+            filters.append(f"minimum_nights <= {request['nights']}")
+        if request['entire']:
+            data = data.loc[data['room_type'] == 'Entire home/apt']
+            filters.append('room_type = Entire home/apt')
+        elif request['hotel']:
+            data = data.loc[data['room_type'] == 'Hotel room']
+            filters.append('room_type = Hotel room')
+        if data.empty:
+            return (f"City: {market_city}. Filters: {', '.join(filters) or 'none'}. "
+                    "ZERO historical priced listings satisfy the property constraints. "
+                    "Do not suggest any matches or invent prices."), pd.DataFrame()
+        grouped_data = (data.groupby('area', dropna=False)['price_num']
+                        .agg(listings='size', median_nightly='median', cheapest_nightly='min')
+                        .reset_index())
+        limit = request['budget_night']
+        if limit is not None:
+            counts = data.loc[data['price_num'] <= limit].groupby('area').size()
+            grouped_data['within_budget'] = grouped_data['area'].map(counts).fillna(0).astype(int)
         else:
-            st.info("Coordinates are not available in this dataset.")
-
-with tab2:
-    st.subheader("Predict nightly listing price")
-    st.caption("A baseline Random Forest regression model. This is a price estimate, not a guarantee of rental income or occupancy.")
-    numeric_candidates = ["accommodates", "bedrooms", "beds", "minimum_nights", "availability_365"]
-    categorical_candidates = ["room_type", "neighborhood"]
-    numeric = [c for c in numeric_candidates if c in df and df[c].notna().any()]
-    categorical = [c for c in categorical_candidates if c in df]
-    features = numeric + categorical
-
-    @st.cache_resource(show_spinner="Training model; this may take a moment...")
-    def train_model(_data, feature_names, numeric_names, categorical_names):
-        sample = _data.sample(n=min(len(_data), 10000), random_state=42)
-        X = sample[list(feature_names)]
-        y = sample["price_eur"]
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        preprocessing = ColumnTransformer([
-            ("numbers", SimpleImputer(strategy="median"), list(numeric_names)),
-            ("categories", Pipeline([
-                ("impute", SimpleImputer(strategy="most_frequent")),
-                ("encode", OneHotEncoder(handle_unknown="ignore")),
-            ]), list(categorical_names)),
-        ])
-        model = Pipeline([
-            ("preprocess", preprocessing),
-            ("regressor", RandomForestRegressor(n_estimators=75, min_samples_leaf=3, random_state=42, n_jobs=-1)),
-        ])
-        model.fit(X_train, y_train)
-        predictions = model.predict(X_test)
-        return model, mean_absolute_error(y_test, predictions), r2_score(y_test, predictions), len(X_train), len(X_test)
-
-    if len(df) < 30 or not numeric:
-        st.warning("Insufficient data or numeric features for training.")
-    else:
-        model, mae, r2, ntrain, ntest = train_model(df, tuple(features), tuple(numeric), tuple(categorical))
-        a, b, c = st.columns(3)
-        a.metric("Test MAE", f"€{mae:,.1f}")
-        b.metric("Test R²", f"{r2:.3f}")
-        c.metric("Train / test rows", f"{ntrain:,} / {ntest:,}")
-        st.caption("MAE is the average absolute prediction error in euros; lower is better. R² can be negative when a model performs worse than predicting the mean.")
-        with st.form("predict"):
-            values = {}
-            col1, col2 = st.columns(2)
-            for i, name in enumerate(numeric):
-                with (col1 if i % 2 == 0 else col2):
-                    median = float(df[name].median())
-                    values[name] = st.number_input(name.replace("_", " ").title(), min_value=0.0, value=max(0.0, median), step=1.0)
-            for i, name in enumerate(categorical):
-                with (col1 if i % 2 == 0 else col2):
-                    values[name] = st.selectbox(name.replace("_", " ").title(), sorted(df[name].dropna().unique()))
-            submitted = st.form_submit_button("Estimate nightly price", type="primary")
-        if submitted:
-            estimate = float(model.predict(pd.DataFrame([values], columns=features))[0])
-            st.success(f"Estimated nightly listing price: €{estimate:,.0f}")
-
-with tab3:
-    st.subheader("Ask a business question")
-    st.caption("Transparent rule-based analytics assistant: calculates answers from the filtered dataset; no external LLM is used.")
-    questions = [
-        "What is the average nightly price?",
-        "Which neighborhoods have the most listings?",
-        "Which neighborhoods are most expensive?",
-        "How do room types compare in price?",
-        "What percentage of listings are available 365 days?",
-    ]
-    question = st.selectbox("Choose a question", questions)
-    if st.button("Analyze", type="primary"):
-        if question == questions[0]:
-            st.info(f"The average nightly price is €{filtered['price_eur'].mean():,.2f} across {len(filtered):,} filtered listings. The median is €{filtered['price_eur'].median():,.2f}.")
-        elif question == questions[1]:
-            result = filtered["neighborhood"].value_counts().head(5)
-            st.dataframe(result.rename("Listings"), use_container_width=True)
-        elif question == questions[2]:
-            agg = filtered.groupby("neighborhood")["price_eur"].agg(["median", "count"])
-            agg = agg[agg["count"] >= 10].sort_values("median", ascending=False).head(5)
-            st.caption("Neighborhoods with at least 10 matching listings; ranked by median nightly price.")
-            st.dataframe(agg.rename(columns={"median":"Median price (€)", "count":"Listings"}), use_container_width=True)
-        elif question == questions[3]:
-            st.dataframe(filtered.groupby("room_type")["price_eur"].agg(["count", "median", "mean"]).round(2), use_container_width=True)
+            grouped_data['within_budget'] = pd.NA
+        if request['nights']:
+            grouped_data['estimated_stay'] = grouped_data['median_nightly'] * request['nights']
         else:
-            if "availability_365" in filtered:
-                valid = filtered["availability_365"].dropna()
-                pct = (valid == 365).mean() * 100 if len(valid) else float("nan")
-                st.info(f"{pct:.1f}% of listings with availability data show 365 available days. This does not measure occupancy or booked nights.")
+            grouped_data['estimated_stay'] = np.nan
+        grouped_data = grouped_data.sort_values(['median_nightly', 'listings'])
+        # Show every NYC borough, or at most 20 Amsterdam neighborhoods.
+        display = grouped_data.head(20).copy()
+        for col in ['median_nightly', 'cheapest_nightly', 'estimated_stay']:
+            display[col] = display[col].round(2)
+        evidence = (f"CITY: {market_city}; CURRENCY: {MARKETS[market_city]['currency']}; "
+                    f"EXPLICIT CONSTRAINTS: {request}; APPLIED DATA FILTERS: {filters}; "
+                    f"MATCHING PRICED LISTINGS BEFORE BUDGET: {len(data)}. "
+                    "The within_budget column counts listings satisfying ALL property filters AND the nightly budget. "
+                    "median_nightly is median among all property-filtered listings in each area, "
+                    "not necessarily the median among budget-matching listings. "
+                    "estimated_stay = median_nightly * nights, EXCLUDING fees and taxes. "
+                    "If no nightly budget is known, within_budget is unavailable. "
+                    "If the median exceeds budget but within_budget > 0, some cheaper matches still exist. "
+                    "DATA TABLE (authoritative; never fabricate or modify):\n" +
+                    display.to_csv(index=False))
+        return evidence, display
+
+    if "ai_chat_history" not in st.session_state:
+        st.session_state.ai_chat_history = []
+    if "ai_chat_city" not in st.session_state:
+        st.session_state.ai_chat_city = city
+
+    top1, top2 = st.columns([3, 1])
+    with top1:
+        st.caption(f"Current destination: **{st.session_state.ai_chat_city}** · You can also mention NYC or Amsterdam in your question.")
+    with top2:
+        if st.button("Clear conversation", width="stretch"):
+            st.session_state.ai_chat_history = []
+            st.session_state.ai_chat_city = city
+            st.rerun()
+
+    for msg in st.session_state.ai_chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    question = st.chat_input("Ask: I have $600 for 4 nights in NYC. Where should I stay?")
+    if question:
+        detected = detect_city(question)
+        if detected:
+            st.session_state.ai_chat_city = detected
+        target_city = st.session_state.ai_chat_city
+        st.session_state.ai_chat_history.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+        request = extract_trip_request(question, target_city)
+        context, evidence_table = build_evidence(target_city, request)
+        system_message = (
+            "You are Analytica AI, a friendly, practical travel accommodation advisor. "
+            "Respond in the user's language. Answer the actual question, including hotel-room requests. "
+            "Use ONLY the supplied market statistics for factual claims about Airbnb listing prices, counts and areas. "
+            "Use the precomputed Pandas evidence table as the ONLY source of numeric listing claims. "
+            "Do not claim the table represents all properties when filters apply. "
+            "Ask for missing nights, guests, or budget instead of assuming them. "
+            "Do not invent individual listings, hotel inventory, neighborhood safety, transport details, real-time prices, "
+            "availability, bookings, taxes or fees. If the user asks to book, explain that you cannot book or verify availability. "
+            "Distinguish historical advertised nightly prices from actual trip costs. "
+            "When the user changes destination, use the city in the supplied market data, not an earlier city. "
+            "Use a compact explanation and never reproduce an incomplete markdown table. "
+            "A complete, accurate table is rendered separately by the application. "
+            "Explain tradeoffs, including when no matching listings exist. "
+            "Never interpret total budget as nightly budget. "
+            "Keep responses clear, helpful and reasonably concise.\n\nVERIFIED PANDAS EVIDENCE:\n" + context
+        )
+        messages = [{"role": "system", "content": system_message}]
+        messages.extend(st.session_state.ai_chat_history[-12:])
+        try:
+            with st.chat_message("assistant"):
+                with st.spinner("Analyzing your trip…"):
+                    client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1", timeout=30.0, max_retries=1)
+                    result = client.chat.completions.create(
+                        model=model_name,
+                        messages=messages,
+                        temperature=0.3,
+                        max_tokens=1500,
+                    )
+                    answer = result.choices[0].message.content or "I couldn't generate a response. Please try again."
+                st.markdown(answer)
+                if not evidence_table.empty:
+                    st.markdown("**Datasetdən hesablanmış tam müqayisə / Verified area comparison**")
+                    st.dataframe(evidence_table, width="stretch", hide_index=True)
+                    st.caption("Counts apply to the requested property constraints. Median prices may exceed the budget even where some cheaper listings exist.")
+                st.caption("Based on historical Inside Airbnb data; availability and final booking costs are not verified.")
+            st.session_state.ai_chat_history.append({"role": "assistant", "content": answer})
+        except Exception as error:
+            # Do not show raw API errors, which may contain sensitive request metadata.
+            status = getattr(error, "status_code", None)
+            if status == 401:
+                st.error("Groq rejected the API key (401). Check that it is valid and active.")
+            elif status == 404:
+                st.error("Model not available (404). Try another model in the selector above.")
+            elif status == 429:
+                st.error("Groq rate limit reached (429). Please wait and try again.")
             else:
-                st.warning("Availability data is not present.")
+                st.error(f"AI request failed ({type(error).__name__}). Check your connection and Groq account.")
+            st.session_state.ai_chat_history.pop()
 
-with tab4:
-    st.subheader("Data and methodology")
-    st.write(f"**Source:** Inside Airbnb, Amsterdam listings, 16 September 2026. **Original rows:** {len(pd.read_csv(DATA_PATH, usecols=['price'])):,}. **Rows after price cleaning:** {len(df):,}.")
-    st.write("**Cleaning:** Parse the price field to numeric euros; remove missing prices and prices outside €10–€2,000. These thresholds are project assumptions, not official Inside Airbnb rules.")
-    st.write("**Model:** Random Forest regression with an 80/20 random train/test split (seed 42). Numeric missing values use median imputation; categorical missing values use most-frequent imputation and one-hot encoding. The model uses listing attributes and neighborhood, not review scores or post-outcome features.")
-    st.write("**Limitations:** Observational listing data, not confirmed transactions. Asking prices may differ from actual paid prices. Single-city, single-date snapshot. Random splits may overestimate future performance. The assistant uses predefined questions, not generative AI.")
-    st.dataframe(filtered.head(100), use_container_width=True)
-    st.download_button("Download filtered CSV", filtered.to_csv(index=False).encode("utf-8"), "amsterdam_airbnb_filtered.csv", "text/csv")
-
-st.caption("Portfolio demonstration • Analytica AI • Source: insideairbnb.com")
+st.markdown('<div class="footer">✦ Analytica AI Global Pro &nbsp; · &nbsp; Inside Airbnb historical listings &nbsp; · &nbsp; Explore smarter, travel better. &nbsp; · &nbsp; No live availability or booking guarantees.</div>', unsafe_allow_html=True)
