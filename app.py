@@ -127,6 +127,161 @@ def travel_matches(df, budget, guests, nights, room, area=None):
         out = out.loc[out["area"] == area]
     return out.sort_values(["price_num", "number_of_reviews"], ascending=[True, False])
 
+
+# Chat parsing and evidence are independent of Streamlit UI, so they can be tested.
+def detect_city(message):
+    text = message.casefold()
+    if re.search(r"\b(nyc|new york|manhattan|brooklyn|queens|bronx|nyu.york|nyu.yorka|nyu.yorkda|n[yü]u.york)\b", text):
+        return "New York City"
+    if re.search(r"\b(amsterdam|ams)\b", text):
+        return "Amsterdam"
+    return None
+
+
+def empty_trip_preferences(market_city):
+    return dict(city=market_city, nights=None, guests=None, bedrooms=None,
+                budget_total=None, budget_night=None, budget_type=None,
+                budget_amount=None, currency_mismatch=False,
+                entire=False, hotel=False)
+
+
+def extract_trip_request(message, market_city):
+    """Extract only explicit information; do not assume an unqualified amount is nightly."""
+    text = message.casefold().replace(",", "")
+    result = empty_trip_preferences(market_city)
+    nights_match = re.search(r"(\d{1,3})\s*(?:gecəlik|gecə|gecəyə|nights?)\b", text)
+    if nights_match:
+        result["nights"] = int(nights_match.group(1))
+    friends = re.search(r"(?:mən\s+)?(\d+)\s+dostumla", text)
+    guests_match = re.search(r"(\d+)\s*(?:nəfər|adam|guests?|people|travelers?)\b", text)
+    english_friends = re.search(r"(\d+)\s+friends?\s+and\s+i\b", text)
+    if friends or english_friends:
+        result["guests"] = int((friends or english_friends).group(1)) + 1
+    elif guests_match:
+        result["guests"] = int(guests_match.group(1))
+    bedrooms = re.search(r"(\d+)\s*(?:yataq otağ\w*|bedrooms?)\b", text)
+    if bedrooms:
+        result["bedrooms"] = int(bedrooms.group(1))
+
+    amount_match = re.search(
+        r"(?P<symbol>[$€])\s*(?P<prefix>\d+(?:\.\d+)?)\b"
+        r"|(?P<suffix>\d+(?:\.\d+)?)\s*(?P<unit>usd|eur|dollars?|euros?|avro|€)\b", text
+    )
+    if amount_match:
+        amount = float(amount_match.group("prefix") or amount_match.group("suffix"))
+        result["budget_amount"] = amount
+        currency = amount_match.group("symbol") or amount_match.group("unit")
+        currency = "$" if currency in ("$", "usd", "dollar", "dollars") else "€"
+        result["currency_mismatch"] = currency != MARKETS[market_city]["currency"]
+        nightly = bool(re.search(r"(?:per\s+night|nightly(?:\s+budget)?|/night|gecəlik\s+büdcə)", text))
+        total = bool(re.search(r"\b(?:total|entire\s+budget|whole\s+budget|overall\s+budget|ümumi|cəmi)\b", text))
+        # The amount and duration must appear in the same phrase, not just anywhere in the question.
+        between = text[amount_match.end():]
+        for_nights = bool(re.match(r"\s+for\s+\d{1,3}\s+nights?\b", between))
+        if nightly and (total or for_nights):
+            result["budget_type"] = "ambiguous"
+        elif nightly:
+            result["budget_type"] = "nightly"
+        elif total or for_nights:
+            result["budget_type"] = "total"
+        else:
+            result["budget_type"] = "ambiguous"
+
+    if re.search(r"(?:bütöv mənzil|bütöv ev|entire (?:home|apartment|place)|whole apartment)", text):
+        result["entire"] = True
+    if re.search(r"(?:hotel|otel|mehmanxana)", text):
+        result["hotel"] = True
+    return recalculate_budget(result)
+
+
+def recalculate_budget(request):
+    """Recompute nightly/total budgets after a later message supplies the nights."""
+    request = request.copy()
+    request["budget_night"] = None
+    request["budget_total"] = None
+    amount = request.get("budget_amount")
+    if amount is None or request.get("currency_mismatch"):
+        return request
+    if request.get("budget_type") == "nightly":
+        request["budget_night"] = amount
+        if request.get("nights"):
+            request["budget_total"] = amount * request["nights"]
+    elif request.get("budget_type") == "total":
+        request["budget_total"] = amount
+        if request.get("nights"):
+            request["budget_night"] = amount / request["nights"]
+    return request
+
+
+def merge_trip_preferences(previous, current):
+    """Preserve constraints across messages, updating only explicitly supplied values."""
+    if previous.get("city") != current["city"]:
+        previous = empty_trip_preferences(current["city"])
+    combined = previous.copy()
+    for field in ("nights", "guests", "bedrooms"):
+        if current[field] is not None:
+            combined[field] = current[field]
+    if current["budget_amount"] is not None:
+        for field in ("budget_amount", "budget_type", "currency_mismatch"):
+            combined[field] = current[field]
+    if current["entire"]:
+        combined["entire"], combined["hotel"] = True, False
+    if current["hotel"]:
+        combined["hotel"], combined["entire"] = True, False
+    return recalculate_budget(combined)
+
+
+def build_evidence(market_city, request):
+    """Compute listing counts and prices in Pandas, never in the LLM."""
+    data = load_market(market_city)
+    if data is None:
+        return "Dataset unavailable; no statistics can be reported.", pd.DataFrame()
+    data = positive(data).copy()
+    filters = []
+    for field in ("guests", "bedrooms", "nights"):
+        value = request.get(field)
+        if value is None:
+            continue
+        col, operator = {"guests": ("accommodates", ">="),
+                         "bedrooms": ("bedrooms", ">="),
+                         "nights": ("minimum_nights", "<=")}[field]
+        data = data.loc[data[col] >= value] if operator == ">=" else data.loc[data[col] <= value]
+        filters.append(f"{col} {operator} {value}")
+    if request.get("entire"):
+        data = data.loc[data["room_type"] == "Entire home/apt"]
+        filters.append("room_type = Entire home/apt")
+    elif request.get("hotel"):
+        data = data.loc[data["room_type"] == "Hotel room"]
+        filters.append("room_type = Hotel room")
+    if data.empty:
+        return (f"CITY: {market_city}. FILTERS: {filters}. ZERO historical priced listings satisfy the "
+                "property constraints. Do not invent matches or prices."), pd.DataFrame()
+    summary = (data.groupby("area", dropna=False)["price_num"]
+               .agg(listings="size", median_nightly="median", cheapest_nightly="min").reset_index())
+    limit = request.get("budget_night")
+    if limit is not None:
+        counts = data.loc[data["price_num"] <= limit].groupby("area").size()
+        summary["within_budget"] = summary["area"].map(counts).fillna(0).astype(int)
+    else:
+        summary["within_budget"] = pd.NA
+    summary["estimated_stay"] = (summary["median_nightly"] * request["nights"]
+                                 if request.get("nights") else np.nan)
+    display = summary.sort_values(["median_nightly", "listings"]).head(20).copy()
+    for col in ("median_nightly", "cheapest_nightly", "estimated_stay"):
+        display[col] = display[col].round(2)
+    evidence = (
+        f"CITY: {market_city}; CURRENCY: {MARKETS[market_city]['currency']}; "
+        f"EXPLICIT AND REMEMBERED CONSTRAINTS: {request}; APPLIED FILTERS: {filters}; "
+        f"MATCHING PRICED LISTINGS BEFORE BUDGET: {len(data)}; "
+        f"DISPLAYED AREAS: {len(display)} OF {len(summary)}. "
+        "The table is a subset when there are more than 20 areas. "
+        "within_budget counts listings satisfying property constraints AND nightly budget. "
+        "median_nightly is BEFORE budget filtering; estimated_stay excludes fees and taxes. "
+        "If budget_type is ambiguous or currency_mismatch is true, ask for clarification; do not "
+        "make budget-specific claims. DATA TABLE (authoritative):\n" + display.to_csv(index=False)
+    )
+    return evidence, display
+
 with st.sidebar:
     st.markdown('<div class="brand"><div class="brand-title"><span class="brand-mark">✦</span>Analytica <b>AI</b></div><div class="brand-sub">YOUR PERSONAL TRAVEL INTELLIGENCE</div></div>', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-label">Discover</div>', unsafe_allow_html=True)
@@ -265,114 +420,28 @@ elif page == "AI Travel Assistant":
         st.stop()
 
     st.markdown("#### 🔑 Connect your own Groq account")
-    st.caption("Bring your own API key (BYOK). The app never uses the owner’s API key and does not save visitor keys to a file or database.")
+    st.caption("Bring your own API key (BYOK). The app does not save visitor keys to a file or database.")
     entered_key = st.text_input(
         "Your Groq API key", type="password", key="visitor_groq_api_key",
         placeholder="gsk_...", help="Create a key at https://console.groq.com/keys. Never paste it into public chats or GitHub.",
     )
-    # Only the visitor-provided key is accepted; never use server secrets or environment variables.
     api_key = entered_key.strip()
     model_name = st.selectbox(
         "AI model", ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],
         help="Availability depends on your Groq account and its current limits.",
     )
     if not api_key:
-        st.info("Enter your own Groq API key above to start chatting. It stays in this browser session's Streamlit state until you clear it or the session ends.")
+        st.info("Enter your own Groq API key above to start chatting. It is held in this Streamlit session; clear the field to remove it from the widget state.")
         st.markdown("[Create a Groq API key](https://console.groq.com/keys)")
         st.stop()
-    st.caption("Privacy: your prompt, relevant market statistics, and key are sent to Groq for inference. Use HTTPS when deploying publicly. Free-tier limits depend on your Groq account.")
-
-    def detect_city(message):
-        text = message.casefold()
-        if re.search(r"\b(nyc|new york|manhattan|brooklyn|queens|bronx|nyu.york|nyu.yorka|nyu.yorkda|n[yü]u.york)\b", text):
-            return "New York City"
-        if re.search(r"\b(amsterdam|ams)\b", text):
-            return "Amsterdam"
-        return None
-
-    def extract_trip_request(message, market_city):
-        """Extract explicit travel constraints; never guess missing details."""
-        text = message.casefold().replace(",", "")
-        nights_match = re.search(r"(\d{1,3})\s*(?:gecəlik|gecə|gecəyə|nights?|night)", text)
-        nights = int(nights_match.group(1)) if nights_match else None
-        # "3 friends and I" means four travelers, not three.
-        friends = re.search(r"(?:mən\s+)?(\d+)\s+dostumla", text)
-        guest_match = re.search(r"(\d+)\s*(?:nəfər|adam|guests?|people|travelers?)", text)
-        guests = int(friends.group(1)) + 1 if friends else (int(guest_match.group(1)) if guest_match else None)
-        bedrooms_match = re.search(r"(?:ən azı|minimum|at least)?\s*(\d+)\s*(?:yataq otağ|bedrooms?)", text)
-        bedrooms = int(bedrooms_match.group(1)) if bedrooms_match else None
-        amounts = re.findall(r"(?:\$\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:dollar|dollars?|usd|avro|eur|€))", text)
-        amount = float(next((a or b for a,b in amounts), 0)) if amounts else None
-        total = bool(re.search(r"\b(?:ümumi|total|entire budget|whole budget)\b", text))
-        nightly = bool(re.search(r"(?:gecəlik büdcə|per night|nightly budget|/night)", text))
-        budget_night = amount / nights if amount is not None and total and nights else (amount if amount is not None and (nightly or not total) else None)
-        entire = bool(re.search(r"(?:bütöv mənzil|bütöv ev|entire (?:home|apartment|place)|whole apartment)", text))
-        hotel = bool(re.search(r"(?:hotel|otel|mehmanxana)", text))
-        return dict(city=market_city, nights=nights, guests=guests, bedrooms=bedrooms,
-                    budget_total=amount if total else None, budget_night=budget_night,
-                    entire=entire, hotel=hotel)
-
-    def build_evidence(market_city, request):
-        """Pandas computes every price and count before the LLM receives evidence."""
-        data = load_market(market_city)
-        if data is None:
-            return "Dataset unavailable; no statistics can be reported.", pd.DataFrame()
-        data = positive(data).copy()
-        filters = []
-        if request['guests'] is not None:
-            data = data.loc[data['accommodates'] >= request['guests']]
-            filters.append(f"accommodates >= {request['guests']}")
-        if request['bedrooms'] is not None:
-            data = data.loc[data['bedrooms'] >= request['bedrooms']]
-            filters.append(f"bedrooms >= {request['bedrooms']}")
-        if request['nights'] is not None:
-            data = data.loc[data['minimum_nights'] <= request['nights']]
-            filters.append(f"minimum_nights <= {request['nights']}")
-        if request['entire']:
-            data = data.loc[data['room_type'] == 'Entire home/apt']
-            filters.append('room_type = Entire home/apt')
-        elif request['hotel']:
-            data = data.loc[data['room_type'] == 'Hotel room']
-            filters.append('room_type = Hotel room')
-        if data.empty:
-            return (f"City: {market_city}. Filters: {', '.join(filters) or 'none'}. "
-                    "ZERO historical priced listings satisfy the property constraints. "
-                    "Do not suggest any matches or invent prices."), pd.DataFrame()
-        grouped_data = (data.groupby('area', dropna=False)['price_num']
-                        .agg(listings='size', median_nightly='median', cheapest_nightly='min')
-                        .reset_index())
-        limit = request['budget_night']
-        if limit is not None:
-            counts = data.loc[data['price_num'] <= limit].groupby('area').size()
-            grouped_data['within_budget'] = grouped_data['area'].map(counts).fillna(0).astype(int)
-        else:
-            grouped_data['within_budget'] = pd.NA
-        if request['nights']:
-            grouped_data['estimated_stay'] = grouped_data['median_nightly'] * request['nights']
-        else:
-            grouped_data['estimated_stay'] = np.nan
-        grouped_data = grouped_data.sort_values(['median_nightly', 'listings'])
-        # Show every NYC borough, or at most 20 Amsterdam neighborhoods.
-        display = grouped_data.head(20).copy()
-        for col in ['median_nightly', 'cheapest_nightly', 'estimated_stay']:
-            display[col] = display[col].round(2)
-        evidence = (f"CITY: {market_city}; CURRENCY: {MARKETS[market_city]['currency']}; "
-                    f"EXPLICIT CONSTRAINTS: {request}; APPLIED DATA FILTERS: {filters}; "
-                    f"MATCHING PRICED LISTINGS BEFORE BUDGET: {len(data)}. "
-                    "The within_budget column counts listings satisfying ALL property filters AND the nightly budget. "
-                    "median_nightly is median among all property-filtered listings in each area, "
-                    "not necessarily the median among budget-matching listings. "
-                    "estimated_stay = median_nightly * nights, EXCLUDING fees and taxes. "
-                    "If no nightly budget is known, within_budget is unavailable. "
-                    "If the median exceeds budget but within_budget > 0, some cheaper matches still exist. "
-                    "DATA TABLE (authoritative; never fabricate or modify):\n" +
-                    display.to_csv(index=False))
-        return evidence, display
+    st.caption("Privacy: your prompt, relevant market statistics, and key are sent to Groq for inference. Use HTTPS when deploying publicly.")
 
     if "ai_chat_history" not in st.session_state:
         st.session_state.ai_chat_history = []
     if "ai_chat_city" not in st.session_state:
         st.session_state.ai_chat_city = city
+    if "ai_trip_preferences" not in st.session_state:
+        st.session_state.ai_trip_preferences = empty_trip_preferences(city)
 
     top1, top2 = st.columns([3, 1])
     with top1:
@@ -381,6 +450,7 @@ elif page == "AI Travel Assistant":
         if st.button("Clear conversation", width="stretch"):
             st.session_state.ai_chat_history = []
             st.session_state.ai_chat_city = city
+            st.session_state.ai_trip_preferences = empty_trip_preferences(city)
             st.rerun()
 
     for msg in st.session_state.ai_chat_history:
@@ -393,26 +463,31 @@ elif page == "AI Travel Assistant":
         if detected:
             st.session_state.ai_chat_city = detected
         target_city = st.session_state.ai_chat_city
+        previous = st.session_state.ai_trip_preferences
+        # Avoid silently applying old budgets in a different currency after switching markets.
+        if previous["city"] != target_city:
+            previous = empty_trip_preferences(target_city)
+        parsed = extract_trip_request(question, target_city)
+        request = merge_trip_preferences(previous, parsed)
+        st.session_state.ai_trip_preferences = request
+        context, evidence_table = build_evidence(target_city, request)
         st.session_state.ai_chat_history.append({"role": "user", "content": question})
         with st.chat_message("user"):
             st.markdown(question)
-        request = extract_trip_request(question, target_city)
-        context, evidence_table = build_evidence(target_city, request)
         system_message = (
             "You are Analytica AI, a friendly, practical travel accommodation advisor. "
             "Respond in the user's language. Answer the actual question, including hotel-room requests. "
             "Use ONLY the supplied market statistics for factual claims about Airbnb listing prices, counts and areas. "
             "Use the precomputed Pandas evidence table as the ONLY source of numeric listing claims. "
-            "Do not claim the table represents all properties when filters apply. "
-            "Ask for missing nights, guests, or budget instead of assuming them. "
+            "Ask for missing nights, guests, or budget rather than assuming them. "
+            "If budget_type is ambiguous or currency_mismatch is true, ask for clarification before making budget-specific recommendations. "
             "Do not invent individual listings, hotel inventory, neighborhood safety, transport details, real-time prices, "
             "availability, bookings, taxes or fees. If the user asks to book, explain that you cannot book or verify availability. "
             "Distinguish historical advertised nightly prices from actual trip costs. "
-            "When the user changes destination, use the city in the supplied market data, not an earlier city. "
-            "Use a compact explanation and never reproduce an incomplete markdown table. "
-            "A complete, accurate table is rendered separately by the application. "
-            "Explain tradeoffs, including when no matching listings exist. "
-            "Never interpret total budget as nightly budget. "
+            "Use the city in the supplied market data, not an earlier city. "
+            "The median price is calculated BEFORE applying budget; within_budget is a count of cheaper matches. "
+            "The table may show only a subset of areas. Do not claim it is complete. "
+            "A comparison table is rendered separately by the application. "
             "Keep responses clear, helpful and reasonably concise.\n\nVERIFIED PANDAS EVIDENCE:\n" + context
         )
         messages = [{"role": "system", "content": system_message}]
@@ -422,26 +497,22 @@ elif page == "AI Travel Assistant":
                 with st.spinner("Analyzing your trip…"):
                     client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1", timeout=30.0, max_retries=1)
                     result = client.chat.completions.create(
-                        model=model_name,
-                        messages=messages,
-                        temperature=0.3,
-                        max_tokens=1500,
+                        model=model_name, messages=messages, temperature=0.3, max_tokens=1500,
                     )
                     answer = result.choices[0].message.content or "I couldn't generate a response. Please try again."
                 st.markdown(answer)
                 if not evidence_table.empty:
-                    st.markdown("**Datasetdən hesablanmış tam müqayisə / Verified area comparison**")
+                    st.markdown("**Historical area comparison (property-filtered, before budget)**")
                     st.dataframe(evidence_table, width="stretch", hide_index=True)
-                    st.caption("Counts apply to the requested property constraints. Median prices may exceed the budget even where some cheaper listings exist.")
-                st.caption("Based on historical Inside Airbnb data; availability and final booking costs are not verified.")
+                    st.caption("within_budget counts listings under your nightly budget. Median prices include listings above budget. At most 20 areas are shown.")
+                st.caption("Historical Inside Airbnb data only; availability and final booking costs are not verified.")
             st.session_state.ai_chat_history.append({"role": "assistant", "content": answer})
         except Exception as error:
-            # Do not show raw API errors, which may contain sensitive request metadata.
             status = getattr(error, "status_code", None)
             if status == 401:
                 st.error("Groq rejected the API key (401). Check that it is valid and active.")
             elif status == 404:
-                st.error("Model not available (404). Try another model in the selector above.")
+                st.error("Model not available (404). Try another model above.")
             elif status == 429:
                 st.error("Groq rate limit reached (429). Please wait and try again.")
             else:
